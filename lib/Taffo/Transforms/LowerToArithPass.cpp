@@ -77,6 +77,22 @@ public:
     return ::llvm::dyn_cast<RealType>(v.getType()).getSignd();
   }
 
+  static Value normalizeOperandWidth(ImplicitLocOpBuilder &b, Value v,
+                                     Value ogV, int targetWidth) {
+    int curWidth = cast<IntegerType>(v.getType()).getWidth();
+    if (curWidth == targetWidth)
+      return v;
+    if (curWidth < targetWidth) {
+      return getSignd(ogV)
+                 ? b.create<arith::ExtSIOp>(b.getIntegerType(targetWidth), v)
+                       .getResult()
+                 : b.create<arith::ExtUIOp>(b.getIntegerType(targetWidth), v)
+                       .getResult();
+    }
+    return b.create<arith::TruncIOp>(b.getIntegerType(targetWidth), v)
+        .getResult();
+  }
+
   template <typename T1, typename T2>
   static LogicalResult ConvertAddCommon(T1 op, T2 adaptor,
                                         ConversionPatternRewriter &rewriter) {
@@ -97,6 +113,9 @@ public:
     int rhsExp = getExp(ogRhs);
     Value lhs = adaptor.getLhs();
     Value rhs = adaptor.getRhs();
+
+    lhs = normalizeOperandWidth(b, lhs, ogLhs, targetWidth);
+    rhs = normalizeOperandWidth(b, rhs, ogRhs, targetWidth);
 
     // reconcile arguments of different signedness
     if (resType.getSignd() && (getSignd(ogRhs) != getSignd(ogLhs))) {
@@ -194,6 +213,9 @@ public:
     int rhsExp = getExp(ogRhs);
     Value lhs = adaptor.getLhs();
     Value rhs = adaptor.getRhs();
+
+    lhs = normalizeOperandWidth(b, lhs, ogLhs, targetWidth);
+    rhs = normalizeOperandWidth(b, rhs, ogRhs, targetWidth);
 
     // reconcile arguments of different signedness (identical to ConvertAdd)
     if (resType.getSignd() && (getSignd(ogRhs) != getSignd(ogLhs))) {
@@ -315,6 +337,9 @@ public:
     Value lhs = adaptor.getLhs();
     Value rhs = adaptor.getRhs();
 
+    lhs = normalizeOperandWidth(b, lhs, ogLhs, resWidth);
+    rhs = normalizeOperandWidth(b, rhs, ogRhs, resWidth);
+
     // reconcile arguments of different signedness
     if (resType.getSignd() && (getSignd(ogRhs) != getSignd(ogLhs))) {
 
@@ -411,6 +436,9 @@ public:
     int denomExp = getExp(ogDenom);
     Value numerator = adaptor.getLhs();
     Value denominator = adaptor.getRhs();
+
+    numerator = normalizeOperandWidth(b, numerator, ogNumerator, resWidth);
+    denominator = normalizeOperandWidth(b, denominator, ogDenom, resWidth);
 
     // reconcile arguments of different signedness
     if (resType.getSignd() && (getSignd(ogNumerator) != getSignd(ogDenom))) {
