@@ -24,16 +24,15 @@ public:
   using DatatypeOptimizationPassBase::DatatypeOptimizationPassBase;
 
   void adaptToBitwidth(Value v) {
-    // RealType oldType = ::llvm::dyn_cast<RealType>(v.getType());
+    RealType oldType = ::llvm::dyn_cast<RealType>(v.getType());
 
-    // // TODO: add NaN/Inf check on exp
-    // int bitwidthDiff = targetBitwidth - oldType.getBitwidth();
-    // int newExp = oldType.getExponent() - bitwidthDiff;
-    // int newBitwidth = targetBitwidth;
+    // TODO: add NaN/Inf check on exp
+    int bitwidthDiff = targetBitwidth - oldType.getBitwidth();
+    int newExp = oldType.getExponent() - bitwidthDiff;
+    int newBitwidth = targetBitwidth;
 
-    // v.setType(
-    //     RealType::get(v.getContext(), oldType.getSignd(), newExp,
-    //     newBitwidth));
+    v.setType(
+        RealType::get(v.getContext(), oldType.getSignd(), newExp, newBitwidth));
   }
 
   void runOnOperation() override {

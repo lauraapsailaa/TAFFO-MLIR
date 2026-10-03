@@ -169,32 +169,8 @@ public:
       max_exp = signd ? max_exp + 1 : max_exp;
 
       RealType type = ::llvm::dyn_cast<RealType>(op->getResult(0).getType());
-      int bitwidth;
-      if (type.getBitwidth()) {
-        // Already set from a prior visit -- preserve it.
-        bitwidth = type.getBitwidth();
-      } else if (auto castOp = llvm::dyn_cast<CastToRealOp>(op)) {
-        double precision = castOp.getPrecision().convertToDouble();
-        if (precision > 0.0 && std::isfinite(precision)) {
-          int precisionExp = static_cast<int>(std::floor(std::log2(precision)));
-          int neededBitwidth = max_exp - precisionExp + 1;
-
-          // Round up to the nearest standard width.
-          static const int kStandardWidths[] = {8, 16, 32, 64};
-          bitwidth = 64;
-          for (int w : kStandardWidths) {
-            if (w >= neededBitwidth) {
-              bitwidth = w;
-              break;
-            }
-          }
-        } else {
-          bitwidth = maxSignificantDigits;
-        }
-      } else {
-        // Not yet handled -- unchanged from today.
-        bitwidth = maxSignificantDigits;
-      }
+      int bitwidth =
+          type.getBitwidth() ? type.getBitwidth() : maxSignificantDigits;
 
       // the left-most bit of an  integer has 2^(bitwidth-1) weight,
       // we want the leftmost bit of the fixed-point integer to have
