@@ -11,8 +11,8 @@
 #include "mlir/IR/TypeRange.h"
 #include "mlir/IR/Visitors.h"
 #include "mlir/Pass/Pass.h"
-#include "llvm/Support/Debug.h"
 #include "mlir/Support/LLVM.h"
+#include <llvm/Support/Debug.h>
 
 #include "mlir/Transforms/DialectConversion.h"
 
@@ -62,8 +62,7 @@ public:
 
       addSourceMaterialization(
           [&](mlir::OpBuilder &builder, mlir::Type resultType,
-              mlir::ValueRange inputs,
-              mlir::Location loc) -> mlir::Value {
+              mlir::ValueRange inputs, mlir::Location loc) -> mlir::Value {
             if (inputs.size() != 1) {
               return {};
             }
@@ -162,6 +161,50 @@ public:
           loc, return_type, input, precision, min, max);
       LLVM_DEBUG(llvm::dbgs() << "Created cast2real:" << cast2real << "\n");
 
+      rewriter.replaceOp(op, cast2real.getResult());
+      return success();
+    }
+  };
+
+  // Same purpose as RewriteSetRangeCall, but matches a generic,
+  // UNREGISTERED "set_range" operation by name instead of requiring a
+  // func.call to a module-level @set_range declaration. Needed because
+  // func.call's symbol resolution genuinely fails when the call is
+  // positioned inside a krnl.region (AffineScope) block -- confirmed via
+  // isolated reproduction, unrelated to anything about the call itself
+  // being malformed. A generic named op doesn't participate in symbol
+  // table lookup at all, sidestepping the issue entirely. Added
+  // alongside (not replacing) RewriteSetRangeCall so existing
+  // func.call-based annotation files keep working unchanged.
+  struct RewriteSetRangeGeneric : public ConversionPattern {
+    RewriteSetRangeGeneric(TypeConverter &typeConverter, MLIRContext *context)
+        : ConversionPattern(typeConverter, "set_range", 1, context) {}
+
+    LogicalResult
+    matchAndRewrite(Operation *op, ArrayRef<Value> operands,
+                    ConversionPatternRewriter &rewriter) const override {
+      if (op->getNumOperands() != 4)
+        return failure();
+      OpBuilder builder(op);
+      auto loc = op->getLoc();
+      Value input = op->getOperand(0);
+      Value secondOperand = op->getOperand(1);
+      Value thirdOperand = op->getOperand(2);
+      Value fourthOperand = op->getOperand(3);
+      auto secondConstOp = secondOperand.getDefiningOp<arith::ConstantOp>();
+      auto thirdConstOp = thirdOperand.getDefiningOp<arith::ConstantOp>();
+      auto fourthConstOp = fourthOperand.getDefiningOp<arith::ConstantOp>();
+      if (!secondConstOp || !thirdConstOp || !fourthConstOp)
+        return failure();
+      auto min = llvm::dyn_cast<FloatAttr>(secondConstOp.getValue());
+      auto max = llvm::dyn_cast<FloatAttr>(thirdConstOp.getValue());
+      auto precision = llvm::dyn_cast<FloatAttr>(fourthConstOp.getValue());
+      if (!min || !max || !precision)
+        return failure();
+      auto return_type =
+          taffo::RealType::get(builder.getContext(), false, 0, 0);
+      auto cast2real = rewriter.create<taffo::CastToRealOp>(
+          loc, return_type, input, precision, min, max);
       rewriter.replaceOp(op, cast2real.getResult());
       return success();
     }
@@ -562,7 +605,7 @@ public:
         [&](scf::IfOp op) { return typeConverter.isLegal(op); });
 
     RewritePatternSet patterns(&getContext());
-    patterns.add<RewriteFor, RewriteSetRangeCall, RewriteArithAddOp, RewriteArithSubOp,
+    patterns.add<RewriteFor, RewriteSetRangeCall, RewriteSetRangeGeneric, RewriteArithAddOp, RewriteArithSubOp,
                  RewriteArithMulOp, RewriteArithDivOp, InsertCast2FloatReturnOp, RemoveSetRangeDef,RewriteIfOp /*,
                  InsertCast2FloatFuncCallOp, RewriteIfOp*/>(typeConverter,
                                                           context);

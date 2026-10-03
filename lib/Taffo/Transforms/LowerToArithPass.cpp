@@ -1,6 +1,7 @@
 #include "Taffo/Transforms/LowerToArithPass.h"
 #include "Taffo/Dialect/Attributes.h"
 #include "Taffo/Dialect/Taffo.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinDialect.h"
@@ -76,6 +77,22 @@ public:
     return ::llvm::dyn_cast<RealType>(v.getType()).getSignd();
   }
 
+  static Value normalizeOperandWidth(ImplicitLocOpBuilder &b, Value v,
+                                     Value ogV, int targetWidth) {
+    int curWidth = cast<IntegerType>(v.getType()).getWidth();
+    if (curWidth == targetWidth)
+      return v;
+    if (curWidth < targetWidth) {
+      return getSignd(ogV)
+                 ? b.create<arith::ExtSIOp>(b.getIntegerType(targetWidth), v)
+                       .getResult()
+                 : b.create<arith::ExtUIOp>(b.getIntegerType(targetWidth), v)
+                       .getResult();
+    }
+    return b.create<arith::TruncIOp>(b.getIntegerType(targetWidth), v)
+        .getResult();
+  }
+
   template <typename T1, typename T2>
   static LogicalResult ConvertAddCommon(T1 op, T2 adaptor,
                                         ConversionPatternRewriter &rewriter) {
@@ -96,6 +113,9 @@ public:
     int rhsExp = getExp(ogRhs);
     Value lhs = adaptor.getLhs();
     Value rhs = adaptor.getRhs();
+
+    lhs = normalizeOperandWidth(b, lhs, ogLhs, targetWidth);
+    rhs = normalizeOperandWidth(b, rhs, ogRhs, targetWidth);
 
     // reconcile arguments of different signedness
     if (resType.getSignd() && (getSignd(ogRhs) != getSignd(ogLhs))) {
@@ -193,6 +213,9 @@ public:
     int rhsExp = getExp(ogRhs);
     Value lhs = adaptor.getLhs();
     Value rhs = adaptor.getRhs();
+
+    lhs = normalizeOperandWidth(b, lhs, ogLhs, targetWidth);
+    rhs = normalizeOperandWidth(b, rhs, ogRhs, targetWidth);
 
     // reconcile arguments of different signedness (identical to ConvertAdd)
     if (resType.getSignd() && (getSignd(ogRhs) != getSignd(ogLhs))) {
@@ -314,6 +337,9 @@ public:
     Value lhs = adaptor.getLhs();
     Value rhs = adaptor.getRhs();
 
+    lhs = normalizeOperandWidth(b, lhs, ogLhs, resWidth);
+    rhs = normalizeOperandWidth(b, rhs, ogRhs, resWidth);
+
     // reconcile arguments of different signedness
     if (resType.getSignd() && (getSignd(ogRhs) != getSignd(ogLhs))) {
 
@@ -410,6 +436,9 @@ public:
     int denomExp = getExp(ogDenom);
     Value numerator = adaptor.getLhs();
     Value denominator = adaptor.getRhs();
+
+    numerator = normalizeOperandWidth(b, numerator, ogNumerator, resWidth);
+    denominator = normalizeOperandWidth(b, denominator, ogDenom, resWidth);
 
     // reconcile arguments of different signedness
     if (resType.getSignd() && (getSignd(ogNumerator) != getSignd(ogDenom))) {
@@ -634,13 +663,7 @@ public:
           b.create<arith::BitcastOp>(fType, actual_exp);
 
       // FIX: the "add to the exponent bits directly" trick above only
-      // correctly scales NON-ZERO values. If the fixed-point integer is
-      // exactly 0, its float bit pattern (from SIToFP/UIToFP) is all
-      // zeros; adding a non-zero constant to THAT doesn't produce 0.0
-      // scaled by 2^exponent -- it corrupts an all-zero pattern into a
-      // spurious non-zero float with a real, garbage exponent field.
-      // Special-case it: if the source integer is zero, produce a real
-      // 0.0 directly instead of going through the bit-trick.
+      // correctly scales NON-ZERO values.
       Value zeroInt = b.create<arith::ConstantOp>(
           b.getIntegerAttr(b.getIntegerType(fromType.getBitwidth()), 0));
       Value isZero = b.create<arith::CmpIOp>(arith::CmpIPredicate::eq,
@@ -655,18 +678,7 @@ public:
   };
 
   // Handles the case where raise-to-taffo inserts a GENERIC
-  // builtin.unrealized_conversion_cast (not a real taffo.cast2float op)
-  // to bridge an already-annotated !taffo.real value into an unraised
-  // consumer that still expects plain float (e.g. arith.maxnumf, which has
-  // no raising rule at all). ConvertCastToFloat only matches real
-  // CastToFloatOp ops, so it can never fire on these -- this pattern
-  // reuses its exact numeric logic, applied to the generic op instead.
-  //
-  // Deliberately ONE-DIRECTIONAL (RealType -> FloatType only): the reverse
-  // direction (float -> real) genuinely needs external range/precision
-  // information that can't be synthesized generically, which is why those
-  // cases are handled via explicit taffo.cast2real annotations elsewhere
-  // in the pipeline, not by a pattern like this one.
+  // builtin.unrealized_conversion_cast
   struct ConvertGenericCastToFloat
       : public OpConversionPattern<UnrealizedConversionCastOp> {
     ConvertGenericCastToFloat(mlir::MLIRContext *context)
@@ -744,13 +756,7 @@ public:
           b.create<arith::BitcastOp>(fType, actual_exp);
 
       // The "add to the exponent bits directly" trick above only
-      // correctly scales NON-ZERO values. If the fixed-point integer is
-      // exactly 0, its float bit pattern (from SIToFP/UIToFP) is all
-      // zeros; adding a non-zero constant to THAT doesn't produce 0.0
-      // scaled by 2^exponent -- it corrupts an all-zero pattern into a
-      // spurious non-zero float with a real, garbage exponent field.
-      // Special-case it: if the source integer is zero, produce a real
-      // 0.0 directly instead of going through the bit-trick.
+      // correctly scales NON-ZERO values.
       Value zeroInt = b.create<arith::ConstantOp>(
           b.getIntegerAttr(b.getIntegerType(fromType.getBitwidth()), 0));
       Value isZero = b.create<arith::CmpIOp>(arith::CmpIPredicate::eq,
@@ -907,24 +913,7 @@ public:
 
   // The matmul reduction loops don't use scf.for iter_args at all (confirmed
   // via debug instrumentation: numRegionIterArgs == 0 for every one of
-  // them). They use a MEMORY-based accumulator instead:
-  //
-  //   %alloca = memref.alloca() : memref<f32>
-  //   affine.store %cst, %alloca[] : memref<f32>        -- init, before loop
-  //   affine.for %i = 0 to N {
-  //     ...compute %delta (a !taffo.real value)...
-  //     %acc_f32  = affine.load %alloca[] : memref<f32>
-  //     %acc_real = <cast f32 to real>(%acc_f32)          -- per-iteration
-  //     %new_real = taffo.add %acc_real, %delta
-  //     %new_f32  = <cast real to f32>(%new_real)         -- per-iteration
-  //     affine.store %new_f32, %alloca[] : memref<f32>
-  //   }
-  //   %final = affine.load %alloca[] : memref<f32>        -- after loop
-  //
-  // Same idea as before -- keep the accumulator natively typed for the
-  // loop's whole duration instead of round-tripping through casts every
-  // iteration -- but retargeted at this memref-based structure: we change
-  // the ALLOCA's element type instead of a block argument's type.
+  // them).
   struct RewriteMemAccumulator : public OpRewritePattern<memref::AllocaOp> {
     const TaffoToArithTypeConverter &typeConverter;
 
@@ -1012,12 +1001,7 @@ public:
       }
       Operation *afterLoad = *bodyLoad->getResult(0).getUsers().begin();
       // Accept either a generic bridging cast OR a real, already-annotated
-      // taffo.cast2real -- functionally equivalent at this point in the
-      // pipeline (VRA/dt-optimization already consumed the annotation's
-      // bounds; by lower-to-arith it's just a type-changing op either way).
-      // Every scalar accumulator load gets a real cast2real here because
-      // insert_annotations.py's --accumulator-range flag pre-annotates all
-      // of them, not just some.
+      // taffo.cast2real
       Operation *castToReal = nullptr;
       if (isa<UnrealizedConversionCastOp>(afterLoad) ||
           isa<CastToRealOp>(afterLoad)) {
@@ -1035,12 +1019,7 @@ public:
       Operation *afterCast = *castToReal->getResult(0).getUsers().begin();
 
       // Some accumulators (e.g. fc3) have an intermediate taffo.align
-      // (exponent realignment) between the cast and the actual add --
-      // recognize and skip through it, but note it for the type-equality
-      // check below: align can genuinely change the exponent, and if it
-      // does, the load-side and store-side would need DIFFERENT native
-      // types, which this rewrite (one native type for the whole alloca)
-      // cannot safely handle. Better to correctly decline than to guess.
+      // (exponent realignment) between the cast and the actual add
       Operation *alignOp = nullptr;
       Operation *accumOp = afterCast;
       if (isa<AlignOp>(afterCast)) {
@@ -1057,12 +1036,7 @@ public:
 
       // The native representation used throughout this rewrite is always
       // accumOp's own result type (what's actually produced and persisted
-      // each iteration) -- NOT castToReal's declared type. When an align
-      // op is present, its whole job is reconciling castToReal's exponent
-      // with what accumOp actually needs; storing/loading natively at
-      // accumOp's exponent from the start makes that reconciliation
-      // unnecessary rather than skipped, so both castToReal and align can
-      // be eliminated together.
+      // each iteration)
 
       if (!accumOp->getResult(0).hasOneUse()) {
         return failure();
@@ -1098,13 +1072,7 @@ public:
       auto newAlloca = b.create<memref::AllocaOp>(newMemrefType);
 
       // 2. Init store: every accumulator init value seen in this codebase
-      // is the literal constant 0.0 -- special-case it directly (0 is
-      // trivially representable in both float and fixed-point, no
-      // scaling/rounding needed) rather than attempting a generic f32 ->
-      // native conversion, which has no lowering pattern here by design
-      // (that direction needs external range info we can't invent).
-      // If the init value is ever NOT provably a zero constant, bail out
-      // of the whole transformation rather than guess.
+      // is the literal constant 0.0
       b.setInsertionPoint(initStore);
       Value initF32 = initStore.getValueToStore();
       auto initConstOp = initF32.getDefiningOp<arith::ConstantOp>();
@@ -1121,25 +1089,13 @@ public:
       b.create<memref::StoreOp>(nativeZero, newAlloca, initStore.getIndices());
       rewriter.eraseOp(initStore);
 
-      // 3. Body: load/store natively. The loaded native value and the
-      // accumulate op's real-typed result represent the SAME underlying
-      // bits -- bridge between them with BitcastToRealOp/BitcastToIntOp
-      // (confirmed to lower to a literal zero-cost pass-through, see
-      // ConvertBitcastToReal/ConvertBitcastToInt above) instead of feeding
-      // the raw native value directly into taffo.add, which requires a
-      // genuinely !taffo.real-typed operand and crashes otherwise (this
-      // is exactly what happened on the first attempt at this rewrite).
+      // 3. Body: load/store natively.
       b.setInsertionPoint(bodyLoad);
       auto newBodyLoad =
           b.create<memref::LoadOp>(newAlloca, bodyLoad.getIndices());
       auto reboxToReal =
           b.create<BitcastToRealOp>(accumType, newBodyLoad.getResult());
-      // Redirect the correct op's uses: if align was present, its rescale
-      // is what made castToReal's exponent match what accumOp needs --
-      // since we now load NATIVELY at accumOp's own exponent already,
-      // that rescale is no longer needed, so align's uses (not
-      // castToReal's) get redirected, and both intermediate ops are
-      // erased. Without align, castToReal's uses are redirected directly,
+      // Redirect the correct op's uses
       // same as before.
       if (alignOp) {
         rewriter.replaceOp(alignOp, reboxToReal.getResult());
@@ -1157,11 +1113,7 @@ public:
       rewriter.eraseOp(bodyStore);
       rewriter.eraseOp(castToFloat);
 
-      // 4. Post-loop loads: load natively, bridge to !taffo.real (zero-cost
-      // bitcast), then to f32 via the EXISTING generic real->float cast
-      // (ConvertGenericCastToFloat), which does the genuine numeric
-      // conversion. A direct native-int -> f32 cast has no lowering
-      // pattern (ConvertGenericCastToFloat requires a RealType operand).
+      // 4. Post-loop loads:
       for (auto load : postLoopLoads) {
         b.setInsertionPoint(load);
         auto newLoad = b.create<memref::LoadOp>(newAlloca, load.getIndices());
@@ -1178,21 +1130,546 @@ public:
     }
   };
 
+  struct RewriteLoopAccumulator : public OpRewritePattern<scf::ForOp> {
+    const TaffoToArithTypeConverter &typeConverter;
+
+    RewriteLoopAccumulator(const TaffoToArithTypeConverter &tc,
+                           MLIRContext *context)
+        : OpRewritePattern<scf::ForOp>(context), typeConverter(tc) {}
+
+    LogicalResult matchAndRewrite(scf::ForOp forOp,
+                                  PatternRewriter &rewriter) const override {
+      if (forOp.getInitArgs().size() != 1 || forOp.getNumResults() != 1)
+        return failure();
+      if (!forOp.getRegionIterArgs()[0].getType().isF32() ||
+          !forOp.getResultTypes()[0].isF32())
+        return failure();
+
+      BlockArgument iterArg = forOp.getRegionIterArgs()[0];
+
+      if (!iterArg.hasOneUse())
+        return failure();
+      Operation *afterIterArg = *iterArg.getUsers().begin();
+      Operation *castToReal = nullptr;
+      if (isa<UnrealizedConversionCastOp>(afterIterArg) ||
+          isa<CastToRealOp>(afterIterArg)) {
+        if (afterIterArg->getNumResults() == 1 &&
+            isa<RealType>(afterIterArg->getResult(0).getType()))
+          castToReal = afterIterArg;
+      }
+      if (!castToReal)
+        return failure();
+
+      if (!castToReal->getResult(0).hasOneUse())
+        return failure();
+      Operation *afterCast = *castToReal->getResult(0).getUsers().begin();
+
+      if (isa<AlignOp>(afterCast))
+        return failure();
+
+      if (!isa<AddOp>(afterCast))
+        return failure();
+      Operation *accumOp = afterCast;
+
+      if (!accumOp->getResult(0).hasOneUse())
+        return failure();
+      Operation *afterAccum = *accumOp->getResult(0).getUsers().begin();
+      Operation *castToFloat = nullptr;
+      if (isa<UnrealizedConversionCastOp>(afterAccum) ||
+          isa<CastToFloatOp>(afterAccum)) {
+        if (afterAccum->getNumResults() == 1 &&
+            afterAccum->getResult(0).getType().isF32())
+          castToFloat = afterAccum;
+      }
+      if (!castToFloat)
+        return failure();
+
+      auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+      if (yieldOp.getOperand(0) != castToFloat->getResult(0))
+        return failure();
+
+      RealType accumType = cast<RealType>(accumOp->getResult(0).getType());
+      Type nativeType = typeConverter.convertType(accumType);
+      if (!nativeType)
+        return failure();
+
+      ImplicitLocOpBuilder b(forOp.getLoc(), rewriter);
+
+      b.setInsertionPoint(forOp);
+      Value initF32 = forOp.getInitArgs()[0];
+      auto initReal = b.create<CastToRealOp>(accumType, initF32);
+      auto initNative =
+          b.create<BitcastToIntOp>(nativeType, initReal.getResult());
+
+      auto newForOp = b.create<scf::ForOp>(
+          forOp.getLowerBound(), forOp.getUpperBound(), forOp.getStep(),
+          ValueRange{initNative.getResult()});
+
+      rewriter.eraseBlock(newForOp.getBody());
+      rewriter.inlineRegionBefore(forOp.getRegion(), newForOp.getRegion(),
+                                  newForOp.getRegion().end());
+
+      Block *newBody = newForOp.getBody();
+      BlockArgument oldIterArg = newBody->getArgument(1);
+      BlockArgument newIterArg =
+          newBody->insertArgument(1u, nativeType, oldIterArg.getLoc());
+
+      b.setInsertionPoint(castToReal);
+      auto reboxToReal = b.create<BitcastToRealOp>(accumType, newIterArg);
+      rewriter.replaceOp(castToReal, reboxToReal.getResult());
+
+      b.setInsertionPoint(castToFloat);
+      auto reboxToInt =
+          b.create<BitcastToIntOp>(nativeType, accumOp->getResult(0));
+      rewriter.replaceOp(castToFloat, reboxToInt.getResult());
+
+      oldIterArg.dropAllUses();
+      newBody->eraseArgument(2u);
+
+      rewriter.replaceOp(forOp, newForOp.getResult(0));
+      return success();
+    }
+  };
+
+  struct RewritePassthroughLoop : public OpRewritePattern<scf::ForOp> {
+    RewritePassthroughLoop(MLIRContext *context)
+        : OpRewritePattern<scf::ForOp>(context) {}
+
+    RealType findInnerAccumType(scf::ForOp innerForOp) const {
+      // Recursive, not just one level deep: for an outermost wrapper
+      // whose own "inner loop" is itself another wrapper (not the
+      // accumulator loop directly), the BitcastToRealOp sits two or more
+      // levels deeper still
+      RealType found = nullptr;
+      innerForOp->walk([&](BitcastToRealOp bcast) {
+        found = cast<RealType>(bcast.getResult().getType());
+        return WalkResult::interrupt();
+      });
+      return found;
+    }
+
+    LogicalResult matchAndRewrite(scf::ForOp forOp,
+                                  PatternRewriter &rewriter) const override {
+      if (forOp.getInitArgs().size() != 1 || forOp.getNumResults() != 1)
+        return failure();
+      if (!forOp.getRegionIterArgs()[0].getType().isF32() ||
+          !forOp.getResultTypes()[0].isF32())
+        return failure();
+
+      BlockArgument iterArg = forOp.getRegionIterArgs()[0];
+      if (!iterArg.hasOneUse())
+        return failure();
+
+      // The body must yield exactly the result of a single inner scf.for,
+      // itself living directly in this same body
+      Block *body = forOp.getBody();
+      auto yieldOp = cast<scf::YieldOp>(body->getTerminator());
+      if (yieldOp.getNumOperands() != 1)
+        return failure();
+      auto innerForOp = yieldOp.getOperand(0).getDefiningOp<scf::ForOp>();
+      if (!innerForOp || innerForOp->getBlock() != body)
+        return failure();
+      if (innerForOp.getInitArgs().size() != 1 ||
+          innerForOp.getNumResults() != 1)
+        return failure();
+
+      Type innerResultType = innerForOp.getResultTypes()[0];
+      if (innerResultType.isF32())
+        return failure(); // inner loop not yet rewritten -- not our turn yet
+
+      RealType accumType = findInnerAccumType(innerForOp);
+      if (!accumType)
+        return failure();
+
+      // --- All checks passed: rewrite. ---
+      ImplicitLocOpBuilder b(forOp.getLoc(), rewriter);
+
+      b.setInsertionPoint(forOp);
+      Value initF32 = forOp.getInitArgs()[0];
+      auto initReal = b.create<CastToRealOp>(accumType, initF32);
+      auto initNative =
+          b.create<BitcastToIntOp>(innerResultType, initReal.getResult());
+
+      auto newForOp = b.create<scf::ForOp>(
+          forOp.getLowerBound(), forOp.getUpperBound(), forOp.getStep(),
+          ValueRange{initNative.getResult()});
+
+      rewriter.eraseBlock(newForOp.getBody());
+      rewriter.inlineRegionBefore(forOp.getRegion(), newForOp.getRegion(),
+                                  newForOp.getRegion().end());
+
+      Block *newBody = newForOp.getBody();
+      BlockArgument oldIterArg = newBody->getArgument(1);
+      BlockArgument newIterArg =
+          newBody->insertArgument(1u, innerResultType, oldIterArg.getLoc());
+
+      // Walk the (possibly empty) chain of single-use, single-result
+      // bridge ops from oldIterArg forward to wherever it actually feeds
+      SmallVector<Operation *> deadChain;
+      {
+        Value cur = oldIterArg;
+        while (cur.hasOneUse()) {
+          Operation *user = *cur.getUsers().begin();
+          if (user == innerForOp.getOperation())
+            break; // reached the end of the chain -- don't include innerForOp
+          if (user->getNumResults() != 1)
+            break; // chain broken; bail out safely
+          deadChain.push_back(user);
+          cur = user->getResult(0);
+        }
+      }
+
+      // Rewire the inner loop's own init operand directly to the new,
+      // already-native outer iter_arg
+      innerForOp.getInitArgsMutable()[0].set(newIterArg);
+
+      // Now that innerForOp no longer references the chain, erase it in
+      // reverse order (last-fed-op first), so each op has zero remaining
+      // uses at the moment it's erased.
+      for (Operation *deadOp : llvm::reverse(deadChain))
+        rewriter.eraseOp(deadOp);
+
+      newBody->eraseArgument(2u);
+
+      auto newYieldOp = cast<scf::YieldOp>(newBody->getTerminator());
+      b.setInsertionPoint(newYieldOp);
+      b.create<scf::YieldOp>(ValueRange{innerForOp.getResult(0)});
+      rewriter.eraseOp(newYieldOp);
+
+      rewriter.replaceOp(forOp, newForOp.getResult(0));
+      return success();
+    }
+  };
+
+  struct RewriteFinalResultBridge : public OpRewritePattern<scf::ForOp> {
+    const TaffoToArithTypeConverter &typeConverter;
+
+    RewriteFinalResultBridge(const TaffoToArithTypeConverter &tc,
+                             MLIRContext *context)
+        : OpRewritePattern<scf::ForOp>(context), typeConverter(tc) {}
+
+    LogicalResult matchAndRewrite(scf::ForOp forOp,
+                                  PatternRewriter &rewriter) const override {
+      if (forOp.getNumResults() != 1)
+        return failure();
+      Type resultType = forOp.getResultTypes()[0];
+      if (resultType.isF32() || isa<RealType>(resultType))
+        return failure();
+
+      if (forOp.getResult(0).use_empty())
+        return failure();
+
+      // Load-bearing guard:
+      for (Operation *user : forOp.getResult(0).getUsers()) {
+        if (isa<scf::YieldOp>(user))
+          return failure();
+      }
+
+      // Idempotency guard:
+      for (Operation *user : forOp.getResult(0).getUsers()) {
+        if (isa<BitcastToRealOp>(user))
+          return failure();
+      }
+
+      RealType accumType = nullptr;
+      forOp->walk([&](BitcastToRealOp bcast) {
+        accumType = cast<RealType>(bcast.getResult().getType());
+        return WalkResult::interrupt();
+      });
+      if (!accumType)
+        return failure();
+
+      ImplicitLocOpBuilder b(forOp.getLoc(), rewriter);
+      b.setInsertionPointAfter(forOp);
+      auto resultToReal =
+          b.create<BitcastToRealOp>(accumType, forOp.getResult(0));
+      auto resultToFloat = b.create<UnrealizedConversionCastOp>(
+          TypeRange{rewriter.getF32Type()},
+          ValueRange{resultToReal.getResult()});
+
+      rewriter.replaceAllUsesExcept(forOp.getResult(0),
+                                    resultToFloat.getResult(0), resultToReal);
+      return success();
+    }
+  };
+
+  // Converts one weight tensor's DenseElementsAttr from float to
+  // fixed-point, using the same op sequence ConvertCastToReal emits at
+  // runtime, but folded once via createOrFold instead of run per-element.
+  // Returns null (with `diag` set) if folding doesn't fully collapse to a
+  // constant -- callers must skip the optimization for this global rather
+  // than leave a partially-folded expression behind.
+  static DenseElementsAttr preconvertWeightTensor(OpBuilder &builder,
+                                                  Location loc,
+                                                  DenseElementsAttr floatData,
+                                                  RealType targetType,
+                                                  std::string &diag) {
+    auto floatTensorType = cast<RankedTensorType>(floatData.getType());
+    FloatType fType = cast<FloatType>(floatTensorType.getElementType());
+    int ogWidth = fType.getWidth();
+
+    if (ogWidth > 64) {
+      diag = "source float width > 64 not supported";
+      return nullptr;
+    }
+    if (targetType.getBitwidth() > 64) {
+      diag = "target fixed-point width > 64 not supported";
+      return nullptr;
+    }
+
+    // Same mantissa/exponent-field math as ConvertCastToReal.
+    int mantissaBitwidth = fType.getFPMantissaWidth() - 1;
+    IntegerType srcIntType = builder.getIntegerType(ogWidth);
+    IntegerType destType = builder.getIntegerType(targetType.getBitwidth());
+    auto destTensorType =
+        RankedTensorType::get(floatTensorType.getShape(), destType);
+
+    // Constant tensor to fold against.
+    Value constTensor =
+        builder.create<arith::ConstantOp>(loc, floatTensorType, floatData);
+
+    // Reinterpret float bits as int.
+    Value bitcast = builder.createOrFold<arith::BitcastOp>(
+        loc, RankedTensorType::get(floatTensorType.getShape(), srcIntType),
+        constTensor);
+
+    // Shift the exponent field by the target fixed-point exponent.
+    int normalized_exp = targetType.getExponent();
+    auto dtExpSplat = DenseElementsAttr::get(
+        RankedTensorType::get(floatTensorType.getShape(), srcIntType),
+        builder.getIntegerAttr(srcIntType, (uint64_t)(std::abs(normalized_exp)
+                                                      << mantissaBitwidth)));
+    Value dtExpConst = builder.create<arith::ConstantOp>(
+        loc, RankedTensorType::get(floatTensorType.getShape(), srcIntType),
+        dtExpSplat);
+    Value actualExp =
+        normalized_exp > 0
+            ? builder.createOrFold<arith::SubIOp>(loc, bitcast, dtExpConst)
+            : builder.createOrFold<arith::AddIOp>(loc, bitcast, dtExpConst);
+
+    // Reinterpret back as float (now scaled by 2^-exponent), then truncate
+    // to the target integer type.
+    Value bitcastBack =
+        builder.createOrFold<arith::BitcastOp>(loc, floatTensorType, actualExp);
+    Value res = targetType.getSignd()
+                    ? builder.createOrFold<arith::FPToSIOp>(loc, destTensorType,
+                                                            bitcastBack)
+                    : builder.createOrFold<arith::FPToUIOp>(loc, destTensorType,
+                                                            bitcastBack);
+
+    // Every input was constant, so `res` should be a fresh arith.constant
+    // createOrFold inserted -- extract its data directly.
+    if (auto constOp = res.getDefiningOp<arith::ConstantOp>()) {
+      if (auto elements = dyn_cast<DenseElementsAttr>(constOp.getValue()))
+        return elements;
+    }
+
+    diag = "constant folding did not fully collapse to a single constant";
+    return nullptr;
+  }
+
+  // Finds every krnl.global feeding a CastToRealOp (via a load) with a
+  // consistent target RealType, and builds its pre-converted integer
+  // twin. Returns original-global -> new-global (or null if declined).
+  static DenseMap<Operation *, Operation *>
+  preconvertConstantWeights(Operation *module,
+                            const TaffoToArithTypeConverter &typeConverter) {
+    DenseMap<Operation *, Operation *> converted;
+    OpBuilder builder(module->getContext());
+
+    int totalCastToReal = 0, notFromLoad = 0, loadNotFromGlobal = 0,
+        alreadyHandled = 0, reachedEnd = 0;
+
+    module->walk([&](CastToRealOp castOp) {
+      totalCastToReal++;
+      // Must come from a load directly off a krnl.global.
+      Operation *loadOp = castOp.getFrom().getDefiningOp();
+      if (!loadOp || !(isa<::mlir::affine::AffineLoadOp>(loadOp) ||
+                       isa<memref::LoadOp>(loadOp))) {
+        notFromLoad++;
+        return;
+      }
+      Value memrefOperand = loadOp->getOperand(0);
+      Operation *globalOp = memrefOperand.getDefiningOp();
+      if (!globalOp || globalOp->getName().getStringRef() != "krnl.global") {
+        loadNotFromGlobal++;
+        return;
+      }
+      if (converted.count(globalOp)) {
+        alreadyHandled++;
+        return; // already handled or already declined
+      }
+      reachedEnd++;
+
+      // Every load off this global must agree on the same RealType.
+      RealType targetType = cast<RealType>(castOp.getResult().getType());
+      bool consistent = true;
+      for (Operation *user : memrefOperand.getUsers()) {
+        bool isLoad = isa<::mlir::affine::AffineLoadOp>(user) ||
+                      isa<memref::LoadOp>(user);
+        if (!isLoad)
+          continue;
+        for (Operation *loadUser : user->getResult(0).getUsers()) {
+          auto otherCast = dyn_cast<CastToRealOp>(loadUser);
+          if (!otherCast)
+            continue;
+          if (cast<RealType>(otherCast.getResult().getType()) != targetType)
+            consistent = false;
+        }
+      }
+      if (!consistent) {
+        llvm::errs() << "[weight-preconvert] declined: inconsistent RealType "
+                        "across loads\n";
+        converted[globalOp] = nullptr;
+        return;
+      }
+
+      // Pull the float data out and convert it.
+      auto valueAttr = globalOp->getAttr("value");
+      auto floatData = dyn_cast_or_null<DenseElementsAttr>(valueAttr);
+      if (!floatData) {
+        llvm::errs() << "[weight-preconvert] declined: value attr is not "
+                        "DenseElementsAttr\n";
+        converted[globalOp] = nullptr;
+        return;
+      }
+
+      builder.setInsertionPoint(globalOp);
+      std::string diag;
+      DenseElementsAttr intData = preconvertWeightTensor(
+          builder, globalOp->getLoc(), floatData, targetType, diag);
+      if (!intData) {
+        globalOp->emitRemark() << "skipping weight pre-conversion: " << diag;
+        converted[globalOp] = nullptr;
+        return;
+      }
+
+      // Rebuild krnl.global explicitly with its three known attributes
+      // (name, shape, value), rather than generically copying whatever
+      // getAttrDictionary() returns -- these are likely stored as ODS
+      // properties, not plain discardable attributes, so a generic copy
+      // from the dictionary can silently miss them.
+      auto origMemrefType = cast<MemRefType>(globalOp->getResult(0).getType());
+      Type nativeElemType = typeConverter.convertType(targetType);
+      auto newMemrefType =
+          MemRefType::get(origMemrefType.getShape(), nativeElemType);
+
+      auto origNameAttr = cast<StringAttr>(globalOp->getAttr("name"));
+      auto newNameAttr =
+          builder.getStringAttr(origNameAttr.getValue().str() + "_fixedpoint");
+      auto shapeAttr = globalOp->getAttr("shape");
+
+      SmallVector<NamedAttribute> newAttrs;
+      newAttrs.push_back(builder.getNamedAttr("name", newNameAttr));
+      newAttrs.push_back(builder.getNamedAttr("shape", shapeAttr));
+      newAttrs.push_back(builder.getNamedAttr("value", intData));
+
+      OperationState state(globalOp->getLoc(), "krnl.global");
+      state.addAttributes(newAttrs);
+      state.addTypes({newMemrefType});
+      Operation *newOp = builder.create(state);
+      llvm::errs() << "[weight-preconvert] created new global, parent block="
+                   << (newOp->getBlock() != nullptr) << ", text: ";
+      newOp->print(llvm::errs());
+      llvm::errs() << "\n";
+      converted[globalOp] = newOp;
+    });
+
+    int genuineSuccesses = 0;
+    for (auto &entry : converted)
+      if (entry.second)
+        genuineSuccesses++;
+
+    llvm::errs() << "[weight-preconvert] total CastToRealOp visited: "
+                 << totalCastToReal << ", not from load: " << notFromLoad
+                 << ", load not from krnl.global: " << loadNotFromGlobal
+                 << ", already handled: " << alreadyHandled
+                 << ", reached conversion attempt: " << reachedEnd
+                 << ", genuinely converted: " << genuineSuccesses << "\n";
+    return converted;
+  }
+
+  // Redirects a weight load+cast to load from the pre-converted global
+  // instead, replacing the expensive CastToRealOp with a cheap
+  // BitcastToRealOp. Read-only over the map built by Step 1.
+  struct RewriteConstantWeightLoad : public OpRewritePattern<CastToRealOp> {
+    const DenseMap<Operation *, Operation *> &convertedGlobals;
+
+    RewriteConstantWeightLoad(
+        const DenseMap<Operation *, Operation *> &converted,
+        MLIRContext *context)
+        : OpRewritePattern<CastToRealOp>(context), convertedGlobals(converted) {
+    }
+
+    LogicalResult matchAndRewrite(CastToRealOp castOp,
+                                  PatternRewriter &rewriter) const override {
+      // Weight reads seen in practice are memref.load, not affine.load --
+      // handle both, mirroring Step 1's own check exactly.
+      Operation *loadOp = castOp.getFrom().getDefiningOp();
+      bool isAffineLoad = loadOp && isa<::mlir::affine::AffineLoadOp>(loadOp);
+      bool isMemrefLoad = loadOp && isa<memref::LoadOp>(loadOp);
+      if (!isAffineLoad && !isMemrefLoad)
+        return failure();
+
+      Value memrefOperand = loadOp->getOperand(0);
+      Operation *globalOp = memrefOperand.getDefiningOp();
+      if (!globalOp)
+        return failure();
+
+      auto it = convertedGlobals.find(globalOp);
+      if (it == convertedGlobals.end() || !it->second)
+        return failure(); // not eligible, or declined by Step 1
+
+      Operation *newGlobal = it->second;
+      RealType resType = cast<RealType>(castOp.getResult().getType());
+
+      // Same indices, new (integer) memref, cheap bitcast instead of the
+      // full runtime conversion.
+      ImplicitLocOpBuilder b(castOp.getLoc(), rewriter);
+      b.setInsertionPoint(loadOp);
+      Value newLoadResult;
+      if (isAffineLoad) {
+        auto load = cast<::mlir::affine::AffineLoadOp>(loadOp);
+        newLoadResult = b.create<::mlir::affine::AffineLoadOp>(
+                             newGlobal->getResult(0), load.getAffineMap(),
+                             load.getMapOperands())
+                            .getResult();
+      } else {
+        auto load = cast<memref::LoadOp>(loadOp);
+        newLoadResult =
+            b.create<memref::LoadOp>(newGlobal->getResult(0), load.getIndices())
+                .getResult();
+      }
+      auto bridged = b.create<BitcastToRealOp>(resType, newLoadResult);
+      rewriter.replaceOp(castOp, bridged.getResult());
+
+      // Old load cleaned up by the greedy driver's own dead-code removal
+      // once it has no remaining uses.
+      return success();
+    }
+  };
+
   void runOnOperation() override {
     MLIRContext *context = &getContext();
     mlir::Operation *module = getOperation();
 
     TaffoToArithTypeConverter typeConverter(context);
 
-    // Run this FIRST, as a separate, plain greedy rewrite -- not as part
-    // of the dialect conversion below. These accumulator loops are judged
-    // "already legal" by the conversion framework (f32->f32 is a trivial
-    // no-op under the type converter), so a conversion pattern would never
-    // even be attempted on them; a greedy rewrite has no such restriction.
+    // Run this FIRST, as a separate, plain greedy rewrite
     {
+      DenseMap<Operation *, Operation *> convertedWeights =
+          preconvertConstantWeights(module, typeConverter);
+
       RewritePatternSet accumPatterns(context);
       accumPatterns.add<RewriteMemAccumulator>(typeConverter, context);
-      if (failed(applyPatternsGreedily(module, std::move(accumPatterns)))) {
+      accumPatterns.add<RewriteLoopAccumulator>(typeConverter, context);
+      accumPatterns.add<RewritePassthroughLoop>(context);
+      accumPatterns.add<RewriteFinalResultBridge>(typeConverter, context);
+      accumPatterns.add<RewriteConstantWeightLoad>(convertedWeights, context);
+      GreedyRewriteConfig accumConfig;
+      accumConfig.setMaxIterations(100);
+      if (failed(applyPatternsGreedily(module, std::move(accumPatterns),
+                                       accumConfig))) {
         signalPassFailure();
         return;
       }
@@ -1204,11 +1681,7 @@ public:
 
     // builtin.unrealized_conversion_cast isn't part of TaffoDialect, so it
     // falls under markUnknownOpDynamicallyLegal's catch-all (legal by
-    // default) -- meaning ConvertGenericCastToFloat would otherwise never
-    // even be attempted by the framework, regardless of whether it's
-    // correctly written. Explicitly mark it illegal ONLY for the specific
-    // !taffo.real -> float pattern we want converted; every other use of
-    // this op (including the type converter's own legitimate materialization
+    // default)
     // bridges elsewhere) remains legal and untouched.
     target.addDynamicallyLegalOp<UnrealizedConversionCastOp>(
         [](UnrealizedConversionCastOp op) {

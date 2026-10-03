@@ -8,6 +8,8 @@
 #include "mlir/Analysis/DataFlow/ConstantPropagationAnalysis.h"
 #include "mlir/Analysis/DataFlow/SparseAnalysis.h"
 #include "mlir/Analysis/DataFlowFramework.h"
+#include "mlir/Dialect/Affine/Analysis/LoopAnalysis.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/Dialect.h"
 #include "mlir/IR/OpDefinition.h"
@@ -15,10 +17,10 @@
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Interfaces/LoopLikeInterface.h"
 #include "mlir/Support/LLVM.h"
-#include "llvm/ADT/STLExtras.h"
-#include "llvm/Support/Casting.h"
 #include <cassert>
 #include <llvm/ADT/APFloat.h>
+#include <llvm/ADT/STLExtras.h>
+#include <llvm/Support/Casting.h>
 #include <optional>
 #include <utility>
 
@@ -38,6 +40,25 @@ TaffoAffineValueRange TaffoAffineValueRange::getMaxRange(Value value) {
 
 static int64_t estimateTripCount(Operation *op) {
   const int64_t defaultTripCount = 100;
+
+  // Handle affine.for loops -- this is the loop construct this pipeline
+  // actually lowers to (via --convert-krnl-to-affine), and was previously
+  // completely unhandled here (only scf::ForOp was checked), meaning
+  // EVERY affine.for loop silently fell through to the 100-iteration
+  // default regardless of its true, statically-known trip count. This
+  // caused the fixpoint-widening early-exit (hitTripCount) to trigger far
+  // later than it should for deeply nested affine.for loops (e.g. Conv's
+  // 3-level reduction, true trip count 3x3x3=27, vs the wrong default of
+  // 100 at each level independently), allowing the range to widen for far
+  // more iterations than the real problem needs -- eventually overflowing
+  // to infinity and then NaN on further combination.
+  auto affineForOp = dyn_cast<affine::AffineForOp>(op);
+  if (affineForOp) {
+    std::optional<uint64_t> tripCount =
+        affine::getConstantTripCount(affineForOp);
+    if (tripCount)
+      return static_cast<int64_t>(*tripCount);
+  }
 
   auto forOp = dyn_cast<scf::ForOp>(op);
 
@@ -213,8 +234,22 @@ void TaffoAffineRangeAnalysis::visitNonControlFlowArguments(
   if (dyn_cast<LoopLikeOpInterface>(op)) {
     auto search = loops.find(op);
     // new loop found
-    if (search == loops.end() && op->getNumResults() > 0 &&
-        llvm::isa<taffo::RealType>(op->getResultTypes().front())) {
+    //
+    // The result-type check that used to gate this (requiring the loop's
+    // result type to already be taffo::RealType) was confirmed via gdb
+    // (loops.size() == 0 at the point of a NaN-producing crash) to
+    // prevent affine.for loops from EVER being registered here: at this
+    // analysis stage, loops are still f32-typed -- the conversion to
+    // !taffo.real happens later, during raise-to-taffo's own type
+    // rewriting. With the loop never tracked, hitTripCount() (in
+    // AffineRangeAnalysis.cpp) unconditionally returns true for every
+    // value inside it, causing the fixpoint-widening early-exit to
+    // trigger on the very first re-visit regardless of the loop's true
+    // trip count -- cutting off convergence before the range has
+    // properly widened, eventually producing NaN on further combination.
+    // Matches visitOperation's own, less restrictive registration
+    // condition (which has no such type check).
+    if (search == loops.end()) {
       loops.insert(std::make_pair(op, estimateTripCount(op)));
       LLVM_DEBUG(llvm::dbgs()
                  << "found new loop " << *op
@@ -227,12 +262,16 @@ void TaffoAffineRangeAnalysis::visitNonControlFlowArguments(
                << "[Affine VRA] Inferring ranges for " << *op << "\n");
     // If the lattice on any operand is unitialized, bail out.
     if (llvm::any_of(op->getOperands(), [&](Value value) {
-          return getLatticeElementFor(getProgramPointAfter(op), value)->getValue().isUninitialized();
+          return getLatticeElementFor(getProgramPointAfter(op), value)
+              ->getValue()
+              .isUninitialized();
         }))
       return;
     SmallVector<Var> argRanges(
         llvm::map_range(op->getOperands(), [&](Value value) {
-          return getLatticeElementFor(getProgramPointAfter(op), value)->getValue().getValue();
+          return getLatticeElementFor(getProgramPointAfter(op), value)
+              ->getValue()
+              .getValue();
         }));
 
     auto parent = loops.find(op->getParentOp());
