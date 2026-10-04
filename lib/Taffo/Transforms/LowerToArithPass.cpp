@@ -77,19 +77,32 @@ public:
     return ::llvm::dyn_cast<RealType>(v.getType()).getSignd();
   }
 
-  static Value normalizeOperandWidth(ImplicitLocOpBuilder &b, Value v,
-                                     Value ogV, int targetWidth) {
-    int curWidth = cast<IntegerType>(v.getType()).getWidth();
-    if (curWidth == targetWidth)
+  static int intWidth(Value v) {
+    return cast<IntegerType>(v.getType()).getWidth();
+  }
+
+  // Sign/zero-extend up to `width` per the operand's own signedness.
+  // Never truncates.
+  static Value extendToWidth(ImplicitLocOpBuilder &b, Value v, Value ogV,
+                             int width) {
+    if (intWidth(v) >= width)
       return v;
-    if (curWidth < targetWidth) {
-      return getSignd(ogV)
-                 ? b.create<arith::ExtSIOp>(b.getIntegerType(targetWidth), v)
-                       .getResult()
-                 : b.create<arith::ExtUIOp>(b.getIntegerType(targetWidth), v)
-                       .getResult();
-    }
-    return b.create<arith::TruncIOp>(b.getIntegerType(targetWidth), v)
+    return getSignd(ogV) ? b.create<arith::ExtSIOp>(b.getIntegerType(width), v)
+                               .getResult()
+                         : b.create<arith::ExtUIOp>(b.getIntegerType(width), v)
+                               .getResult();
+  }
+
+  // Truncate to `width` if wider; no-op otherwise.
+  static Value truncToWidth(ImplicitLocOpBuilder &b, Value v, int width) {
+    if (intWidth(v) == width)
+      return v;
+    return b.create<arith::TruncIOp>(b.getIntegerType(width), v).getResult();
+  }
+
+  // Integer constant with the same type as `like`.
+  static Value constLike(ImplicitLocOpBuilder &b, Value like, int64_t value) {
+    return b.create<arith::ConstantOp>(b.getIntegerAttr(like.getType(), value))
         .getResult();
   }
 
@@ -103,10 +116,6 @@ public:
 
     const int targetWidth = resType.getBitwidth();
 
-    auto buildIntAttr = [targetWidth](Builder b, int64_t value) -> IntegerAttr {
-      return b.getIntegerAttr(b.getIntegerType(targetWidth), value);
-    };
-
     Value ogLhs = op.getLhs();
     Value ogRhs = op.getRhs();
     int lhsExp = getExp(ogLhs);
@@ -114,8 +123,16 @@ public:
     Value lhs = adaptor.getLhs();
     Value rhs = adaptor.getRhs();
 
-    lhs = normalizeOperandWidth(b, lhs, ogLhs, targetWidth);
-    rhs = normalizeOperandWidth(b, rhs, ogRhs, targetWidth);
+    // Compute at the widest width; narrow only the final result.
+    const int workWidth = std::max({targetWidth, intWidth(lhs), intWidth(rhs)});
+    auto buildIntAttr = [workWidth](Builder b, int64_t value) -> IntegerAttr {
+      return b.getIntegerAttr(b.getIntegerType(workWidth), value);
+    };
+    lhs = extendToWidth(b, lhs, ogLhs, workWidth);
+    rhs = extendToWidth(b, rhs, ogRhs, workWidth);
+    auto finish = [&](Value res) {
+      rewriter.replaceOp(op, truncToWidth(b, res, targetWidth));
+    };
 
     // reconcile arguments of different signedness
     if (resType.getSignd() && (getSignd(ogRhs) != getSignd(ogLhs))) {
@@ -139,9 +156,9 @@ public:
     // if the difference in exponent is large enough that largest number of
     // the smaller operand cannot be represented by the larger operand,
     // we delete the op
-    if (expDiff > targetWidth) {
+    if (expDiff > workWidth) {
       Value maxExpArg = rhsExp > lhsExp ? rhs : lhs;
-      rewriter.replaceOp(op, maxExpArg);
+      finish(maxExpArg);
       return success();
     }
 
@@ -165,7 +182,7 @@ public:
     int resExpDiff = resType.getExponent() - std::max(rhsExp, lhsExp);
 
     if (resExpDiff == 0) {
-      rewriter.replaceOp(op, res);
+      finish(res);
       return success();
     }
 
@@ -176,7 +193,7 @@ public:
                     ? b.create<arith::ShRSIOp>(res, align_res).getResult()
                     : b.create<arith::ShRUIOp>(res, align_res).getResult()
               : b.create<arith::ShLIOp>(res, align_res).getResult();
-    rewriter.replaceOp(op, res);
+    finish(res);
     return success();
   }
 
@@ -203,10 +220,6 @@ public:
 
     const int targetWidth = resType.getBitwidth();
 
-    auto buildIntAttr = [targetWidth](Builder b, int64_t value) -> IntegerAttr {
-      return b.getIntegerAttr(b.getIntegerType(targetWidth), value);
-    };
-
     Value ogLhs = op.getLhs();
     Value ogRhs = op.getRhs();
     int lhsExp = getExp(ogLhs);
@@ -214,8 +227,16 @@ public:
     Value lhs = adaptor.getLhs();
     Value rhs = adaptor.getRhs();
 
-    lhs = normalizeOperandWidth(b, lhs, ogLhs, targetWidth);
-    rhs = normalizeOperandWidth(b, rhs, ogRhs, targetWidth);
+    // Compute at the widest width; narrow only the final result.
+    const int workWidth = std::max({targetWidth, intWidth(lhs), intWidth(rhs)});
+    auto buildIntAttr = [workWidth](Builder b, int64_t value) -> IntegerAttr {
+      return b.getIntegerAttr(b.getIntegerType(workWidth), value);
+    };
+    lhs = extendToWidth(b, lhs, ogLhs, workWidth);
+    rhs = extendToWidth(b, rhs, ogRhs, workWidth);
+    auto finish = [&](Value res) {
+      rewriter.replaceOp(op, truncToWidth(b, res, targetWidth));
+    };
 
     // reconcile arguments of different signedness (identical to ConvertAdd)
     if (resType.getSignd() && (getSignd(ogRhs) != getSignd(ogLhs))) {
@@ -241,23 +262,21 @@ public:
     // operand is negligible at this bitwidth. Unlike addition, subtraction
     // is NOT symmetric here: if rhs dominates, the result is approximately
     // -rhs (not +rhs), since lhs contributes ~0.
-    if (expDiff > targetWidth) {
+    if (expDiff > workWidth) {
       if (rhsExp > lhsExp) {
         Value zero = b.create<arith::ConstantOp>(buildIntAttr(b, 0));
         Value negRhs = b.create<arith::SubIOp>(zero, rhs).getResult();
-        rewriter.replaceOp(op, negRhs);
+        finish(negRhs);
       } else {
-        rewriter.replaceOp(op, lhs);
+        finish(lhs);
       }
       return success();
     }
 
     // Align both operands to the same (coarser/larger) exponent by shifting
-    // whichever has the SMALLER exponent right by expDiff. Unlike
-    // ConvertAdd's "no_shift"/"to_shift" naming (safe there only because
-    // addition is commutative), we track alignedLhs/alignedRhs explicitly
-    // so the final SubIOp's operand order always matches the original
-    // lhs - rhs, regardless of which one needed shifting.
+    // whichever has the SMALLER exponent right by expDiff. alignedLhs /
+    // alignedRhs are tracked explicitly so the final SubIOp's operand order
+    // always matches the original lhs - rhs.
     Value alignedLhs = lhs;
     Value alignedRhs = rhs;
 
@@ -282,7 +301,7 @@ public:
     int resExpDiff = resType.getExponent() - std::max(rhsExp, lhsExp);
 
     if (resExpDiff == 0) {
-      rewriter.replaceOp(op, res);
+      finish(res);
       return success();
     }
 
@@ -293,7 +312,7 @@ public:
                     ? b.create<arith::ShRSIOp>(res, align_res).getResult()
                     : b.create<arith::ShRUIOp>(res, align_res).getResult()
               : b.create<arith::ShLIOp>(res, align_res).getResult();
-    rewriter.replaceOp(op, res);
+    finish(res);
     return success();
   }
 
@@ -320,15 +339,6 @@ public:
 
     const int resWidth = resType.getBitwidth();
     const int ogWidth = resWidth;
-    const int extWidth = resWidth * 2;
-
-    auto buildNarrowAttr = [ogWidth](Builder b, int64_t value) -> IntegerAttr {
-      return b.getIntegerAttr(b.getIntegerType(ogWidth), value);
-    };
-
-    auto buildWideAttr = [extWidth](Builder b, int64_t value) -> IntegerAttr {
-      return b.getIntegerAttr(b.getIntegerType(extWidth), value);
-    };
 
     Value ogLhs = op.getLhs();
     Value ogRhs = op.getRhs();
@@ -337,24 +347,26 @@ public:
     Value lhs = adaptor.getLhs();
     Value rhs = adaptor.getRhs();
 
-    lhs = normalizeOperandWidth(b, lhs, ogLhs, resWidth);
-    rhs = normalizeOperandWidth(b, rhs, ogRhs, resWidth);
+    // Wide type must hold the full product of the operands as given.
+    // Equals 2*resWidth when both operands are resWidth wide (original).
+    const int extWidth = std::max(resWidth * 2, intWidth(lhs) + intWidth(rhs));
 
-    // reconcile arguments of different signedness
+    auto buildWideAttr = [extWidth](Builder b, int64_t value) -> IntegerAttr {
+      return b.getIntegerAttr(b.getIntegerType(extWidth), value);
+    };
+
+    // reconcile arguments of different signedness; the shift constant takes
+    // each operand's own type, since operands may not be resWidth wide.
     if (resType.getSignd() && (getSignd(ogRhs) != getSignd(ogLhs))) {
 
       if (!getSignd(ogLhs)) {
         lhsExp += 1;
-        lhs = b.create<arith::ShRUIOp>(
-                   lhs, b.create<arith::ConstantOp>(buildNarrowAttr(b, 1)))
-                  .getResult();
+        lhs = b.create<arith::ShRUIOp>(lhs, constLike(b, lhs, 1)).getResult();
       }
 
       if (!getSignd(ogRhs)) {
         rhsExp += 1;
-        rhs = b.create<arith::ShRUIOp>(
-                   rhs, b.create<arith::ConstantOp>(buildNarrowAttr(b, 1)))
-                  .getResult();
+        rhs = b.create<arith::ShRUIOp>(rhs, constLike(b, rhs, 1)).getResult();
       }
     }
 
@@ -420,15 +432,6 @@ public:
     RealType resType = ::llvm::dyn_cast<RealType>(op->getResult(0).getType());
     const int resWidth = resType.getBitwidth();
     const int ogWidth = resWidth;
-    const int extWidth = resWidth * 2;
-
-    auto buildNarrowAttr = [ogWidth](Builder b, int64_t value) -> IntegerAttr {
-      return b.getIntegerAttr(b.getIntegerType(ogWidth), value);
-    };
-
-    auto buildWideAttr = [extWidth](Builder b, int64_t value) -> IntegerAttr {
-      return b.getIntegerAttr(b.getIntegerType(extWidth), value);
-    };
 
     Value ogNumerator = op.getLhs();
     Value ogDenom = op.getRhs();
@@ -437,24 +440,30 @@ public:
     Value numerator = adaptor.getLhs();
     Value denominator = adaptor.getRhs();
 
-    numerator = normalizeOperandWidth(b, numerator, ogNumerator, resWidth);
-    denominator = normalizeOperandWidth(b, denominator, ogDenom, resWidth);
+    // Wide type must hold the widest operand shifted left by resWidth.
+    // Equals 2*resWidth when both operands are resWidth wide (original).
+    const int extWidth =
+        std::max({resWidth, intWidth(numerator), intWidth(denominator)}) +
+        resWidth;
 
-    // reconcile arguments of different signedness
+    auto buildWideAttr = [extWidth](Builder b, int64_t value) -> IntegerAttr {
+      return b.getIntegerAttr(b.getIntegerType(extWidth), value);
+    };
+
+    // reconcile arguments of different signedness; the shift constant takes
+    // each operand's own type, since operands may not be resWidth wide.
     if (resType.getSignd() && (getSignd(ogNumerator) != getSignd(ogDenom))) {
       if (!getSignd(ogNumerator)) {
         numExp += 1;
         numerator =
-            b.create<arith::ShRUIOp>(
-                 numerator, b.create<arith::ConstantOp>(buildNarrowAttr(b, 1)))
+            b.create<arith::ShRUIOp>(numerator, constLike(b, numerator, 1))
                 .getResult();
       }
       if (!getSignd(ogDenom)) {
         denomExp += 1;
-        denominator = b.create<arith::ShRUIOp>(
-                           denominator,
-                           b.create<arith::ConstantOp>(buildNarrowAttr(b, 1)))
-                          .getResult();
+        denominator =
+            b.create<arith::ShRUIOp>(denominator, constLike(b, denominator, 1))
+                .getResult();
       }
     }
 
