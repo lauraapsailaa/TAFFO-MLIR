@@ -349,7 +349,7 @@ public:
 
     // Wide type must hold the full product of the operands as given.
     // Equals 2*resWidth when both operands are resWidth wide (original).
-    const int extWidth = std::max(resWidth * 2, intWidth(lhs) + intWidth(rhs));
+    const int extWidth = std::max(resWidth, intWidth(lhs) + intWidth(rhs));
 
     auto buildWideAttr = [extWidth](Builder b, int64_t value) -> IntegerAttr {
       return b.getIntegerAttr(b.getIntegerType(extWidth), value);
@@ -374,23 +374,27 @@ public:
     int expDiff = resType.getExponent() - implicitExp;
 
     // extend operands
-    lhs = resType.getSignd()
-              ? b.create<arith::ExtSIOp>(b.getIntegerType(extWidth), lhs)
-                    .getResult()
-              : b.create<arith::ExtUIOp>(b.getIntegerType(extWidth), lhs)
-                    .getResult();
-    rhs = resType.getSignd()
-              ? b.create<arith::ExtSIOp>(b.getIntegerType(extWidth), rhs)
-                    .getResult()
-              : b.create<arith::ExtUIOp>(b.getIntegerType(extWidth), rhs)
-                    .getResult();
+    // Skip the extension when an operand is already extWidth wide
+    // (extsi/extui require a strictly wider result).
+    if (intWidth(lhs) < extWidth)
+      lhs = resType.getSignd()
+                ? b.create<arith::ExtSIOp>(b.getIntegerType(extWidth), lhs)
+                      .getResult()
+                : b.create<arith::ExtUIOp>(b.getIntegerType(extWidth), lhs)
+                      .getResult();
+    if (intWidth(rhs) < extWidth)
+      rhs = resType.getSignd()
+                ? b.create<arith::ExtSIOp>(b.getIntegerType(extWidth), rhs)
+                      .getResult()
+                : b.create<arith::ExtUIOp>(b.getIntegerType(extWidth), rhs)
+                      .getResult();
 
     Value res = b.create<arith::MulIOp>(lhs, rhs).getResult();
 
     // this is probably unnecessary as I expect shifts by 0 get folded away
     // TODO: check if this check is necessary
     if (expDiff == 0) {
-      rewriter.replaceOp(op, res);
+      rewriter.replaceOp(op, truncToWidth(b, res, ogWidth));
       return success();
     }
 
@@ -406,7 +410,7 @@ public:
                     : b.create<arith::ShRUIOp>(res, align_res).getResult()
               : b.create<arith::ShLIOp>(res, align_res).getResult();
 
-    res = b.create<arith::TruncIOp>(b.getIntegerType(ogWidth), res).getResult();
+    res = truncToWidth(b, res, ogWidth);
     rewriter.replaceOp(op, res);
     return success();
   }
