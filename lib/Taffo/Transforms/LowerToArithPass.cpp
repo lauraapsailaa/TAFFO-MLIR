@@ -1589,6 +1589,53 @@ public:
     }
   };
 
+  // "fixed-point -> float -> fixed-point" rescale: a value converted to f32
+  // and straight back to another fixed-point type is converted with integer
+  // shifts instead, with the same rounding (toward zero) and 32-bit
+  // saturation as the float round trip, but without the int->float->int
+  // conversions.
+  //
+  // Only destinations of at least 32 bits are handled: for narrower ones the
+  // float path's behaviour on out-of-range values depends on how the result
+  // is used afterwards, and is left as is.
+  struct RewriteRescaleRoundTrip : public OpRewritePattern<CastToRealOp> {
+    const TaffoToArithTypeConverter &typeConverter;
+
+    RewriteRescaleRoundTrip(const TaffoToArithTypeConverter &tc,
+                            MLIRContext *context)
+        : OpRewritePattern<CastToRealOp>(context), typeConverter(tc) {}
+
+    LogicalResult matchAndRewrite(CastToRealOp castOp,
+                                  PatternRewriter &rewriter) const override {
+      Value f = castOp.getFrom();
+      if (!f.getType().isF32() || !f.hasOneUse())
+        return failure();
+      RealType src = nullptr;
+      Operation *toFloat = RewriteActivationBuffer::asCastToFloat(f, src);
+      if (!toFloat)
+        return failure();
+      RealType dst = cast<RealType>(castOp.getResult().getType());
+      if (dst.getBitwidth() < 32)
+        return failure();
+      if (!RewriteActivationBuffer::canConvert(src, dst))
+        return failure();
+
+      Type srcNative = typeConverter.convertType(src);
+      if (!srcNative || !isa<IntegerType>(srcNative))
+        return failure();
+
+      ImplicitLocOpBuilder b(castOp.getLoc(), rewriter);
+      b.setInsertionPoint(castOp);
+      Value srcInt = b.create<BitcastToIntOp>(srcNative, toFloat->getOperand(0))
+                         .getResult();
+      Value res = RewriteActivationBuffer::convertForBuffer(b, srcInt, src, dst,
+                                                            /*relu=*/false);
+      auto asReal = b.create<BitcastToRealOp>(dst, res);
+      rewriter.replaceOp(castOp, asReal.getResult());
+      return success();
+    }
+  };
+
   struct RewritePassthroughLoop : public OpRewritePattern<scf::ForOp> {
     RewritePassthroughLoop(MLIRContext *context)
         : OpRewritePattern<scf::ForOp>(context) {}
@@ -2022,6 +2069,7 @@ public:
       accumPatterns.add<RewriteMemAccumulator>(typeConverter, context);
       accumPatterns.add<RewriteLoopAccumulator>(typeConverter, context);
       accumPatterns.add<RewriteActivationBuffer>(typeConverter, context);
+      accumPatterns.add<RewriteRescaleRoundTrip>(typeConverter, context);
       accumPatterns.add<RewritePassthroughLoop>(context);
       accumPatterns.add<RewriteFinalResultBridge>(typeConverter, context);
       accumPatterns.add<RewriteConstantWeightLoad>(convertedWeights, context);
