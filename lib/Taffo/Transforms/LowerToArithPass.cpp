@@ -1258,6 +1258,337 @@ public:
     }
   };
 
+  // Activation buffers: a memref<...xf32> whose every element is written as
+  // "fixed-point value -> float" and read back as "float -> fixed-point" is
+  // stored as an integer instead. The conversion happens once, at the store,
+  // and reproduces what the float round trip did: scale by the exponent
+  // difference (rounding toward zero), saturate to the 32-bit range of the
+  // float-to-int conversion, then wrap to the width of the reader's type.
+  // Loads become a plain integer load + bitcast.
+  //
+  // Only buffers whose users are all loads, stores, plain copies and deallocs,
+  // whose loads all read the same fixed-point type (all with, or all without, a
+  // relu max(x, 0.0) in between), and whose stores are all either a fixed-point
+  // value or the constant 0.0, are rewritten. Anything else (for example the
+  // buffer returned to the caller) is left untouched.
+  struct RewriteActivationBuffer : public OpRewritePattern<memref::AllocOp> {
+    const TaffoToArithTypeConverter &typeConverter;
+
+    RewriteActivationBuffer(const TaffoToArithTypeConverter &tc,
+                            MLIRContext *context)
+        : OpRewritePattern<memref::AllocOp>(context), typeConverter(tc) {}
+
+    // f32 -> RealType bridge (taffo.cast2real or a generic cast).
+    static Operation *asCastToReal(Operation *op, RealType &rt) {
+      if (!isa<CastToRealOp>(op) && !isa<UnrealizedConversionCastOp>(op))
+        return nullptr;
+      if (op->getNumOperands() != 1 || op->getNumResults() != 1 ||
+          !op->getOperand(0).getType().isF32())
+        return nullptr;
+      rt = dyn_cast<RealType>(op->getResult(0).getType());
+      return rt ? op : nullptr;
+    }
+
+    // RealType -> f32 bridge (taffo.cast2float or a generic cast).
+    static Operation *asCastToFloat(Value v, RealType &rt) {
+      Operation *op = v.getDefiningOp();
+      if (!op ||
+          (!isa<CastToFloatOp>(op) && !isa<UnrealizedConversionCastOp>(op)))
+        return nullptr;
+      if (op->getNumOperands() != 1 || op->getNumResults() != 1 ||
+          !v.getType().isF32())
+        return nullptr;
+      rt = dyn_cast<RealType>(op->getOperand(0).getType());
+      return rt ? op : nullptr;
+    }
+
+    static bool isFloatZero(Value v) {
+      auto c = v.getDefiningOp<arith::ConstantOp>();
+      if (!c)
+        return false;
+      auto attr = dyn_cast<FloatAttr>(c.getValue());
+      return attr && attr.getValue().isZero();
+    }
+
+    // Can `src` be converted to `dst` by convertForBuffer without overflowing
+    // the 64-bit intermediate?
+    static bool canConvert(RealType src, RealType dst) {
+      // Shift amounts are kept below 31 so they stay valid even if a later
+      // pass narrows the operands to 32 bits.
+      int d = src.getExponent() - dst.getExponent();
+      if (d > 0)
+        return d <= 30 && (int)src.getBitwidth() + d <= 62;
+      return -d <= 30;
+    }
+
+    // `v` is the integer representation (iS) of a value of type `src`.
+    // Returns its representation in `dst`, as an integer of dst's width.
+    static Value convertForBuffer(ImplicitLocOpBuilder &b, Value v,
+                                  RealType src, RealType dst, bool relu) {
+      Type i64 = b.getIntegerType(64);
+      auto c64 = [&](int64_t x) -> Value {
+        return b.create<arith::ConstantOp>(b.getIntegerAttr(i64, x))
+            .getResult();
+      };
+      bool sgS = src.getSignd(), sgD = dst.getSignd();
+      Value cur = v;
+      if (src.getBitwidth() < 64)
+        cur = sgS ? b.create<arith::ExtSIOp>(i64, cur).getResult()
+                  : b.create<arith::ExtUIOp>(i64, cur).getResult();
+      if (relu && sgS)
+        cur = b.create<arith::MaxSIOp>(cur, c64(0)).getResult();
+      int d = src.getExponent() - dst.getExponent();
+      if (d > 0) {
+        cur = b.create<arith::ShLIOp>(cur, c64(d)).getResult();
+      } else if (d < 0) {
+        int sh = -d;
+        if (sgS && !relu) {
+          // Round toward zero, like fptosi: add (2^sh - 1) to negative
+          // values before the arithmetic shift. Written with compare/select
+          // so that no shift amount exceeds the operand width, even after a
+          // later int-range narrowing shrinks these ops.
+          Value neg =
+              b.create<arith::CmpIOp>(arith::CmpIPredicate::slt, cur, c64(0))
+                  .getResult();
+          Value bias = b.create<arith::SelectOp>(
+                            neg, c64((int64_t(1) << sh) - 1), c64(0))
+                           .getResult();
+          cur = b.create<arith::AddIOp>(cur, bias).getResult();
+        }
+        cur = sgS ? b.create<arith::ShRSIOp>(cur, c64(sh)).getResult()
+                  : b.create<arith::ShRUIOp>(cur, c64(sh)).getResult();
+      }
+      // saturate like fcvt.w/wu.s
+      if (sgD) {
+        if (sgS) {
+          cur = b.create<arith::MaxSIOp>(cur, c64(-(int64_t(1) << 31)))
+                    .getResult();
+          cur = b.create<arith::MinSIOp>(cur, c64((int64_t(1) << 31) - 1))
+                    .getResult();
+        } else {
+          cur = b.create<arith::MinUIOp>(cur, c64((int64_t(1) << 31) - 1))
+                    .getResult();
+        }
+      } else {
+        if (sgS) {
+          // The value is non-negative after the max, so the upper clamp is
+          // done unsigned: a later int-range narrowing to i32 turns the
+          // constant 2^32-1 into -1, which a signed min would misread.
+          cur = b.create<arith::MaxSIOp>(cur, c64(0)).getResult();
+          cur = b.create<arith::MinUIOp>(cur, c64((int64_t(1) << 32) - 1))
+                    .getResult();
+        } else {
+          cur = b.create<arith::MinUIOp>(cur, c64((int64_t(1) << 32) - 1))
+                    .getResult();
+        }
+      }
+      if (dst.getBitwidth() < 64)
+        cur =
+            b.create<arith::TruncIOp>(b.getIntegerType(dst.getBitwidth()), cur)
+                .getResult();
+      return cur;
+    }
+
+    struct LoadInfo {
+      memref::LoadOp load;
+      Operation *relu; // arith.maxnumf(load, 0.0) or null
+      Operation *cast;
+      Operation *alloc;
+    };
+    struct StoreInfo {
+      memref::StoreOp store;
+      Operation *cast; // null when the stored value is the constant 0.0
+      RealType type;
+      Operation *alloc;
+    };
+    // load from one buffer stored straight into another (no conversion)
+    struct CopyInfo {
+      memref::LoadOp load;
+      memref::StoreOp store;
+      Operation *src, *dst;
+    };
+    struct DeallocInfo {
+      memref::DeallocOp dealloc;
+      Operation *alloc;
+    };
+
+    // Buffers linked by plain f32 copies (for example a relu output copied
+    // into a zero-padded buffer) are converted together, because they must
+    // share one storage type.
+    LogicalResult matchAndRewrite(memref::AllocOp root,
+                                  PatternRewriter &rewriter) const override {
+      SmallVector<memref::AllocOp> allocs;
+      SmallPtrSet<Operation *, 8> inGroup;
+      auto addAlloc = [&](memref::AllocOp a) -> bool {
+        MemRefType mt = a.getType();
+        if (!mt.getElementType().isF32() || mt.getRank() == 0)
+          return false; // rank 0 is RewriteMemAccumulator's job
+        if (inGroup.insert(a.getOperation()).second)
+          allocs.push_back(a);
+        return true;
+      };
+
+      SmallVector<LoadInfo> loads;
+      SmallVector<StoreInfo> stores;
+      SmallVector<CopyInfo> copies;
+      SmallVector<DeallocInfo> deallocs;
+      RealType loadType = nullptr;
+      int reluState = -1; // -1 unknown, 0 none, 1 relu
+
+      if (!addAlloc(root))
+        return failure();
+
+      for (size_t gi = 0; gi < allocs.size(); ++gi) {
+        memref::AllocOp alloc = allocs[gi];
+        for (Operation *user : alloc->getUsers()) {
+          if (auto load = dyn_cast<memref::LoadOp>(user)) {
+            if (!load.getResult().hasOneUse())
+              return failure();
+            Operation *next = *load.getResult().getUsers().begin();
+            if (auto st = dyn_cast<memref::StoreOp>(next)) {
+              // plain copy into another buffer
+              if (st.getValueToStore() != load.getResult())
+                return failure();
+              auto dst = st.getMemRef().getDefiningOp<memref::AllocOp>();
+              if (!dst || !addAlloc(dst))
+                return failure();
+              copies.push_back({load, st, alloc, dst});
+              continue;
+            }
+            Operation *relu = nullptr;
+            if (auto mx = dyn_cast<arith::MaxNumFOp>(next)) {
+              Value other =
+                  mx.getLhs() == load.getResult() ? mx.getRhs() : mx.getLhs();
+              if (!isFloatZero(other) || !mx.getResult().hasOneUse())
+                return failure();
+              relu = mx;
+              next = *mx.getResult().getUsers().begin();
+            }
+            RealType rt = nullptr;
+            Operation *cast = asCastToReal(next, rt);
+            if (!cast)
+              return failure();
+            if (loadType && loadType != rt)
+              return failure();
+            loadType = rt;
+            int r = relu ? 1 : 0;
+            if (reluState != -1 && reluState != r)
+              return failure();
+            reluState = r;
+            loads.push_back({load, relu, cast, alloc});
+          } else if (auto store = dyn_cast<memref::StoreOp>(user)) {
+            if (store.getMemRef() != alloc.getResult())
+              return failure();
+            Value v = store.getValueToStore();
+            RealType rt = nullptr;
+            if (auto srcLoad = v.getDefiningOp<memref::LoadOp>()) {
+              // the copy itself is recorded from the source buffer's side
+              auto src = srcLoad.getMemRef().getDefiningOp<memref::AllocOp>();
+              if (!src || !addAlloc(src))
+                return failure();
+            } else if (Operation *cast = asCastToFloat(v, rt)) {
+              stores.push_back({store, cast, rt, alloc});
+            } else if (isFloatZero(v)) {
+              stores.push_back({store, nullptr, nullptr, alloc});
+            } else {
+              return failure();
+            }
+          } else if (auto dealloc = dyn_cast<memref::DeallocOp>(user)) {
+            deallocs.push_back({dealloc, alloc});
+          } else {
+            return failure(); // returned, passed to a call, viewed, ...
+          }
+        }
+      }
+      if (!loadType || loads.empty() || stores.empty())
+        return failure();
+      bool relu = reluState == 1;
+
+      Type nativeType = typeConverter.convertType(loadType);
+      if (!nativeType || !isa<IntegerType>(nativeType))
+        return failure();
+      for (StoreInfo &si : stores)
+        if (si.cast && !canConvert(si.type, loadType))
+          return failure();
+
+      // --- All checks passed: rewrite the whole group. ---
+      ImplicitLocOpBuilder b(root.getLoc(), rewriter);
+      DenseMap<Operation *, memref::AllocOp> newOf;
+      for (memref::AllocOp alloc : allocs) {
+        MemRefType mt = alloc.getType();
+        auto newType = MemRefType::get(mt.getShape(), nativeType,
+                                       mt.getLayout(), mt.getMemorySpace());
+        b.setLoc(alloc.getLoc());
+        b.setInsertionPoint(alloc);
+        newOf[alloc] = b.create<memref::AllocOp>(
+            newType, alloc.getDynamicSizes(), alloc.getSymbolOperands(),
+            alloc.getAlignmentAttr());
+      }
+
+      for (LoadInfo &li : loads) {
+        b.setLoc(li.load.getLoc());
+        b.setInsertionPoint(li.load);
+        auto newLoad =
+            b.create<memref::LoadOp>(newOf[li.alloc], li.load.getIndices());
+        auto asReal = b.create<BitcastToRealOp>(loadType, newLoad.getResult());
+        rewriter.replaceOp(li.cast, asReal.getResult());
+        if (li.relu)
+          rewriter.eraseOp(li.relu);
+        rewriter.eraseOp(li.load);
+      }
+
+      for (CopyInfo &ci : copies) {
+        b.setLoc(ci.load.getLoc());
+        b.setInsertionPoint(ci.load);
+        auto newLoad =
+            b.create<memref::LoadOp>(newOf[ci.src], ci.load.getIndices());
+        b.setLoc(ci.store.getLoc());
+        b.setInsertionPoint(ci.store);
+        b.create<memref::StoreOp>(newLoad.getResult(), newOf[ci.dst],
+                                  ci.store.getIndices());
+        rewriter.eraseOp(ci.store);
+        rewriter.eraseOp(ci.load);
+      }
+
+      SmallVector<Operation *> deadCasts;
+      for (StoreInfo &si : stores) {
+        b.setLoc(si.store.getLoc());
+        b.setInsertionPoint(si.store);
+        Value nativeVal;
+        if (!si.cast) {
+          nativeVal =
+              b.create<arith::ConstantOp>(rewriter.getZeroAttr(nativeType));
+        } else {
+          Type srcNative = typeConverter.convertType(si.type);
+          Value srcInt =
+              b.create<BitcastToIntOp>(srcNative, si.cast->getOperand(0))
+                  .getResult();
+          nativeVal = convertForBuffer(b, srcInt, si.type, loadType, relu);
+          deadCasts.push_back(si.cast);
+        }
+        b.create<memref::StoreOp>(nativeVal, newOf[si.alloc],
+                                  si.store.getIndices());
+        rewriter.eraseOp(si.store);
+      }
+      // A cast may feed several stores; remove each one once it is unused.
+      SmallPtrSet<Operation *, 8> seen;
+      for (Operation *c : deadCasts)
+        if (seen.insert(c).second && c->use_empty())
+          rewriter.eraseOp(c);
+
+      for (DeallocInfo &di : deallocs) {
+        b.setLoc(di.dealloc.getLoc());
+        b.setInsertionPoint(di.dealloc);
+        b.create<memref::DeallocOp>(newOf[di.alloc]);
+        rewriter.eraseOp(di.dealloc);
+      }
+
+      for (memref::AllocOp alloc : allocs)
+        rewriter.eraseOp(alloc);
+      return success();
+    }
+  };
+
   struct RewritePassthroughLoop : public OpRewritePattern<scf::ForOp> {
     RewritePassthroughLoop(MLIRContext *context)
         : OpRewritePattern<scf::ForOp>(context) {}
@@ -1690,6 +2021,7 @@ public:
       RewritePatternSet accumPatterns(context);
       accumPatterns.add<RewriteMemAccumulator>(typeConverter, context);
       accumPatterns.add<RewriteLoopAccumulator>(typeConverter, context);
+      accumPatterns.add<RewriteActivationBuffer>(typeConverter, context);
       accumPatterns.add<RewritePassthroughLoop>(context);
       accumPatterns.add<RewriteFinalResultBridge>(typeConverter, context);
       accumPatterns.add<RewriteConstantWeightLoad>(convertedWeights, context);
