@@ -1177,12 +1177,21 @@ public:
         return failure();
       Operation *afterCast = *castToReal->getResult(0).getUsers().begin();
 
-      if (isa<AlignOp>(afterCast))
-        return failure();
-
-      if (!isa<AddOp>(afterCast))
-        return failure();
+      // Some accumulators have an exponent realignment (taffo.align) between
+      // the cast and the add. The carried value is always stored in the add's
+      // own type, so that realignment becomes redundant (same treatment as
+      // RewriteMemAccumulator).
+      Operation *alignOp = nullptr;
       Operation *accumOp = afterCast;
+      if (isa<AlignOp>(afterCast)) {
+        alignOp = afterCast;
+        if (!alignOp->getResult(0).hasOneUse())
+          return failure();
+        accumOp = *alignOp->getResult(0).getUsers().begin();
+      }
+
+      if (!isa<AddOp>(accumOp))
+        return failure();
 
       if (!accumOp->getResult(0).hasOneUse())
         return failure();
@@ -1229,7 +1238,12 @@ public:
 
       b.setInsertionPoint(castToReal);
       auto reboxToReal = b.create<BitcastToRealOp>(accumType, newIterArg);
-      rewriter.replaceOp(castToReal, reboxToReal.getResult());
+      if (alignOp) {
+        rewriter.replaceOp(alignOp, reboxToReal.getResult());
+        rewriter.eraseOp(castToReal);
+      } else {
+        rewriter.replaceOp(castToReal, reboxToReal.getResult());
+      }
 
       b.setInsertionPoint(castToFloat);
       auto reboxToInt =
