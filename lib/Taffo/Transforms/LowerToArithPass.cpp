@@ -5,8 +5,10 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinDialect.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/IR/Visitors.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 
@@ -1394,6 +1396,8 @@ public:
       Operation *relu; // arith.maxnumf(load, 0.0) or null
       Operation *cast;
       Operation *alloc;
+      Operation *view =
+          nullptr; // memref.reinterpret_cast the load goes through
     };
     struct StoreInfo {
       memref::StoreOp store;
@@ -1438,44 +1442,65 @@ public:
       if (!addAlloc(root))
         return failure();
 
+      SmallVector<memref::ReinterpretCastOp> views;
+      // Checks one load of `alloc` (directly, or through `view`) and records
+      // it. Returns false when the buffer cannot be converted.
+      auto handleLoad = [&](memref::LoadOp load, memref::AllocOp alloc,
+                            Operation *view) -> bool {
+        if (!load.getResult().hasOneUse())
+          return false;
+        Operation *next = *load.getResult().getUsers().begin();
+        if (auto st = dyn_cast<memref::StoreOp>(next)) {
+          // plain copy into another buffer
+          if (view || st.getValueToStore() != load.getResult())
+            return false;
+          auto dst = st.getMemRef().getDefiningOp<memref::AllocOp>();
+          if (!dst || !addAlloc(dst))
+            return false;
+          copies.push_back({load, st, alloc, dst});
+          return true;
+        }
+        Operation *relu = nullptr;
+        if (auto mx = dyn_cast<arith::MaxNumFOp>(next)) {
+          Value other =
+              mx.getLhs() == load.getResult() ? mx.getRhs() : mx.getLhs();
+          if (!isFloatZero(other) || !mx.getResult().hasOneUse())
+            return false;
+          relu = mx;
+          next = *mx.getResult().getUsers().begin();
+        }
+        RealType rt = nullptr;
+        Operation *cast = asCastToReal(next, rt);
+        if (!cast)
+          return false;
+        if (loadType && loadType != rt)
+          return false;
+        loadType = rt;
+        int r = relu ? 1 : 0;
+        if (reluState != -1 && reluState != r)
+          return false;
+        reluState = r;
+        loads.push_back({load, relu, cast, alloc, view});
+        return true;
+      };
+
       for (size_t gi = 0; gi < allocs.size(); ++gi) {
         memref::AllocOp alloc = allocs[gi];
         for (Operation *user : alloc->getUsers()) {
           if (auto load = dyn_cast<memref::LoadOp>(user)) {
-            if (!load.getResult().hasOneUse())
+            if (!handleLoad(load, alloc, nullptr))
               return failure();
-            Operation *next = *load.getResult().getUsers().begin();
-            if (auto st = dyn_cast<memref::StoreOp>(next)) {
-              // plain copy into another buffer
-              if (st.getValueToStore() != load.getResult())
+          } else if (auto view = dyn_cast<memref::ReinterpretCastOp>(user)) {
+            // a reshaped view that is only read
+            if (view.getSource() != alloc.getResult())
+              return failure();
+            for (Operation *vu : view.getResult().getUsers()) {
+              auto vl = dyn_cast<memref::LoadOp>(vu);
+              if (!vl || vl.getMemRef() != view.getResult() ||
+                  !handleLoad(vl, alloc, view))
                 return failure();
-              auto dst = st.getMemRef().getDefiningOp<memref::AllocOp>();
-              if (!dst || !addAlloc(dst))
-                return failure();
-              copies.push_back({load, st, alloc, dst});
-              continue;
             }
-            Operation *relu = nullptr;
-            if (auto mx = dyn_cast<arith::MaxNumFOp>(next)) {
-              Value other =
-                  mx.getLhs() == load.getResult() ? mx.getRhs() : mx.getLhs();
-              if (!isFloatZero(other) || !mx.getResult().hasOneUse())
-                return failure();
-              relu = mx;
-              next = *mx.getResult().getUsers().begin();
-            }
-            RealType rt = nullptr;
-            Operation *cast = asCastToReal(next, rt);
-            if (!cast)
-              return failure();
-            if (loadType && loadType != rt)
-              return failure();
-            loadType = rt;
-            int r = relu ? 1 : 0;
-            if (reluState != -1 && reluState != r)
-              return failure();
-            reluState = r;
-            loads.push_back({load, relu, cast, alloc});
+            views.push_back(view);
           } else if (auto store = dyn_cast<memref::StoreOp>(user)) {
             if (store.getMemRef() != alloc.getResult())
               return failure();
@@ -1525,11 +1550,25 @@ public:
             alloc.getAlignmentAttr());
       }
 
+      DenseMap<Operation *, Value> newView;
+      for (memref::ReinterpretCastOp view : views) {
+        MemRefType vt = view.getType();
+        auto newVT = MemRefType::get(vt.getShape(), nativeType, vt.getLayout(),
+                                     vt.getMemorySpace());
+        b.setLoc(view.getLoc());
+        b.setInsertionPoint(view);
+        newView[view] = b.create<memref::ReinterpretCastOp>(
+                             newVT, newOf[view.getSource().getDefiningOp()],
+                             view.getMixedOffsets()[0], view.getMixedSizes(),
+                             view.getMixedStrides())
+                            .getResult();
+      }
+
       for (LoadInfo &li : loads) {
         b.setLoc(li.load.getLoc());
         b.setInsertionPoint(li.load);
-        auto newLoad =
-            b.create<memref::LoadOp>(newOf[li.alloc], li.load.getIndices());
+        Value src = li.view ? newView[li.view] : newOf[li.alloc].getResult();
+        auto newLoad = b.create<memref::LoadOp>(src, li.load.getIndices());
         auto asReal = b.create<BitcastToRealOp>(loadType, newLoad.getResult());
         rewriter.replaceOp(li.cast, asReal.getResult());
         if (li.relu)
@@ -1583,6 +1622,8 @@ public:
         rewriter.eraseOp(di.dealloc);
       }
 
+      for (memref::ReinterpretCastOp view : views)
+        rewriter.eraseOp(view);
       for (memref::AllocOp alloc : allocs)
         rewriter.eraseOp(alloc);
       return success();
@@ -1632,6 +1673,109 @@ public:
                                                             /*relu=*/false);
       auto asReal = b.create<BitcastToRealOp>(dst, res);
       rewriter.replaceOp(castOp, asReal.getResult());
+      return success();
+    }
+  };
+
+  // Quantize a function input once, up front.
+  //
+  // A float input array that is only read by `load -> cast2real` is
+  // converted to its fixed-point type in a small loop at function entry and
+  // stored in an integer buffer; the original loads then read that buffer.
+  // Without this the float -> fixed conversion is repeated for every use of
+  // each element (for a dense layer: once per output neuron).
+  //
+  // The conversion is the same cast2real, so the values are identical.
+  // The loop at function entry carries the `taffo.input_quant` attribute so
+  // that the pattern does not match its own loads again.
+  struct RewriteInputQuantization : public OpRewritePattern<memref::LoadOp> {
+    const TaffoToArithTypeConverter &typeConverter;
+
+    RewriteInputQuantization(const TaffoToArithTypeConverter &tc,
+                             MLIRContext *context)
+        : OpRewritePattern<memref::LoadOp>(context), typeConverter(tc) {}
+
+    static bool insideQuantLoop(Operation *op) {
+      for (auto f = op->getParentOfType<scf::ForOp>(); f;
+           f = f->getParentOfType<scf::ForOp>())
+        if (f->hasAttr("taffo.input_quant"))
+          return true;
+      return false;
+    }
+
+    LogicalResult matchAndRewrite(memref::LoadOp anchor,
+                                  PatternRewriter &rewriter) const override {
+      auto arg = dyn_cast<BlockArgument>(anchor.getMemRef());
+      if (!arg)
+        return failure();
+      Block *entry = arg.getOwner();
+      if (!entry->isEntryBlock() ||
+          !isa_and_nonnull<FunctionOpInterface>(entry->getParentOp()))
+        return failure();
+      auto mt = dyn_cast<MemRefType>(arg.getType());
+      if (!mt || !mt.getElementType().isF32() || !mt.hasStaticShape() ||
+          mt.getRank() < 1 || !mt.getLayout().isIdentity() ||
+          mt.getNumElements() > (1 << 20))
+        return failure();
+      if (insideQuantLoop(anchor))
+        return failure();
+
+      SmallVector<memref::LoadOp> loads;
+      SmallVector<Operation *> casts;
+      RealType rt = nullptr;
+      for (Operation *user : arg.getUsers()) {
+        auto ld = dyn_cast<memref::LoadOp>(user);
+        if (!ld || ld.getMemRef() != arg || !ld.getResult().hasOneUse() ||
+            insideQuantLoop(ld))
+          return failure();
+        Operation *c = *ld.getResult().user_begin();
+        RealType t = nullptr;
+        if (!RewriteActivationBuffer::asCastToReal(c, t))
+          return failure();
+        if (rt && t != rt)
+          return failure();
+        rt = t;
+        loads.push_back(ld);
+        casts.push_back(c);
+      }
+      if (loads.empty() || !rt)
+        return failure();
+      Type native = typeConverter.convertType(rt);
+      if (!native || !isa<IntegerType>(native))
+        return failure();
+
+      ImplicitLocOpBuilder b(anchor.getLoc(), rewriter);
+      b.setInsertionPointToStart(entry);
+      Value buf =
+          b.create<memref::AllocaOp>(MemRefType::get(mt.getShape(), native));
+      Value c0 = b.create<arith::ConstantIndexOp>(0);
+      Value c1 = b.create<arith::ConstantIndexOp>(1);
+      SmallVector<Value> ivs;
+      scf::ForOp outer;
+      for (int64_t dim : mt.getShape()) {
+        Value ub = b.create<arith::ConstantIndexOp>(dim);
+        auto loop = b.create<scf::ForOp>(c0, ub, c1);
+        if (!outer)
+          outer = loop;
+        ivs.push_back(loop.getInductionVar());
+        b.setInsertionPoint(loop.getBody()->getTerminator());
+      }
+      Value f = b.create<memref::LoadOp>(arg, ivs);
+      IRMapping map;
+      map.map(loads[0].getResult(), f);
+      Operation *cl = b.clone(*casts[0], map);
+      Value iv = b.create<BitcastToIntOp>(native, cl->getResult(0));
+      b.create<memref::StoreOp>(iv, buf, ivs);
+      outer->setAttr("taffo.input_quant", rewriter.getUnitAttr());
+
+      for (size_t i = 0; i < loads.size(); ++i) {
+        b.setLoc(loads[i].getLoc());
+        b.setInsertionPoint(loads[i]);
+        auto nl = b.create<memref::LoadOp>(buf, loads[i].getIndices());
+        auto asReal = b.create<BitcastToRealOp>(rt, nl.getResult());
+        rewriter.replaceOp(casts[i], asReal.getResult());
+        rewriter.eraseOp(loads[i]);
+      }
       return success();
     }
   };
@@ -2070,6 +2214,7 @@ public:
       accumPatterns.add<RewriteLoopAccumulator>(typeConverter, context);
       accumPatterns.add<RewriteActivationBuffer>(typeConverter, context);
       accumPatterns.add<RewriteRescaleRoundTrip>(typeConverter, context);
+      accumPatterns.add<RewriteInputQuantization>(typeConverter, context);
       accumPatterns.add<RewritePassthroughLoop>(context);
       accumPatterns.add<RewriteFinalResultBridge>(typeConverter, context);
       accumPatterns.add<RewriteConstantWeightLoad>(convertedWeights, context);
