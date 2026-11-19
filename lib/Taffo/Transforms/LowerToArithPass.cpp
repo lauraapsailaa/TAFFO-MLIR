@@ -1260,19 +1260,7 @@ public:
     }
   };
 
-  // Activation buffers: a memref<...xf32> whose every element is written as
-  // "fixed-point value -> float" and read back as "float -> fixed-point" is
-  // stored as an integer instead. The conversion happens once, at the store,
-  // and reproduces what the float round trip did: scale by the exponent
-  // difference (rounding toward zero), saturate to the 32-bit range of the
-  // float-to-int conversion, then wrap to the width of the reader's type.
-  // Loads become a plain integer load + bitcast.
-  //
-  // Only buffers whose users are all loads, stores, plain copies and deallocs,
-  // whose loads all read the same fixed-point type (all with, or all without, a
-  // relu max(x, 0.0) in between), and whose stores are all either a fixed-point
-  // value or the constant 0.0, are rewritten. Anything else (for example the
-  // buffer returned to the caller) is left untouched.
+  // Activation buffers
   struct RewriteActivationBuffer : public OpRewritePattern<memref::AllocOp> {
     const TaffoToArithTypeConverter &typeConverter;
 
@@ -1632,13 +1620,7 @@ public:
 
   // "fixed-point -> float -> fixed-point" rescale: a value converted to f32
   // and straight back to another fixed-point type is converted with integer
-  // shifts instead, with the same rounding (toward zero) and 32-bit
-  // saturation as the float round trip, but without the int->float->int
-  // conversions.
-  //
-  // Only destinations of at least 32 bits are handled: for narrower ones the
-  // float path's behaviour on out-of-range values depends on how the result
-  // is used afterwards, and is left as is.
+  // shifts instead
   struct RewriteRescaleRoundTrip : public OpRewritePattern<CastToRealOp> {
     const TaffoToArithTypeConverter &typeConverter;
 
@@ -1678,16 +1660,6 @@ public:
   };
 
   // Quantize a function input once, up front.
-  //
-  // A float input array that is only read by `load -> cast2real` is
-  // converted to its fixed-point type in a small loop at function entry and
-  // stored in an integer buffer; the original loads then read that buffer.
-  // Without this the float -> fixed conversion is repeated for every use of
-  // each element (for a dense layer: once per output neuron).
-  //
-  // The conversion is the same cast2real, so the values are identical.
-  // The loop at function entry carries the `taffo.input_quant` attribute so
-  // that the pattern does not match its own loads again.
   struct RewriteInputQuantization : public OpRewritePattern<memref::LoadOp> {
     const TaffoToArithTypeConverter &typeConverter;
 
