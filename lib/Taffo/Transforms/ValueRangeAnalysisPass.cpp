@@ -147,7 +147,7 @@ public:
       // Hardcoding for f32, in the future it will need to work off of either
       // precision, number of significant digits, or a global parameter
       // const int maxBitwidth = 32;
-      const int maxSignificantDigits = 24;
+      const int maxSignificantDigits = 32;
 
       auto getLog2 = [](::llvm::APFloat f) -> int {
         return static_cast<int>(
